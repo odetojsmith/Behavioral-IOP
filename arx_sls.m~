@@ -1,0 +1,154 @@
+n_horizon = 10;
+n_length_sim = 100;
+t_opt_start = 10;
+[dim,sys_state] = sys_gen();
+sanity_check(sys_state);
+sys_arx = space_to_arx(sys_state);
+
+if isfile('u_input.mat')
+    load u_input.mat
+else  
+    u_input = normrnd(0,1,n_length_sim,dim.u);
+    save('u_input.mat','u_input');
+end
+
+sys_state_onlystate = onlystate(sys_state,dim);
+t = 1:100;
+t = t'-1;
+x_state = lsim(sys_state_onlystate,u_input,t,zeros(dim.x,1));
+y_ini = y_output(t_opt_start-dim.x+1 : t_opt_start, :);
+y_ini = y_ini';
+y_ini = y_ini(:);
+
+
+Z = z_gen(dim,n_horizon);
+dim.A_y = dim.y * (n_horizon+dim.x);
+dim.B_u = dim.u * (n_horizon+dim.x);
+I_tot = eye(dim.A_y);
+A_y = zeros(dim.A_y,dim.A_y);
+B_u = zeros(dim.A_y,dim.B_u);
+for k = 1 : dim.x
+    A_y = A_y + Z^k * diag_mat(sys_arx,k,1,n_horizon+dim.x);
+    B_u = B_u + Z^k * diag_mat(sys_arx,k,2,n_horizon+dim.x);
+end
+A_y(1: dim.x * dim.y,1:dim.x * dim.y) = zeros(dim.x * dim.y,dim.x * dim.y);
+B_u(1:dim.x * dim.y,:) = zeros(dim.x * dim.y,size(B_u,2));
+A_y = I_tot-A_y;
+B_u = -B_u;
+res = test_aybu(A_y,B_u,y_output,u_input,dim,t_opt_start,n_horizon);
+
+Sigma_yu  = cell(1,2);
+Sigma_yu{1,1} = diag(y_ini);
+Sigma_yu{1,2} = eye(dim.y * n_horizon);
+Sigma_yu = blkdiag(Sigma_yu{:});
+Q = eye(dim.y*(n_horizon+dim.x));
+Q(1:dim.y*dim.x,1:dim.y*dim.x) = zeros(dim.y*dim.x,dim.y*dim.x);
+R = 10 * eye(dim.u*(n_horizon+dim.x));
+% R(1:dim.u*dim.x,1:dim.u*dim.x) = zeros(dim.u*dim.x,dim.u*dim.x);
+
+R(1:dim.u*dim.x,1:dim.u*dim.x) = 1 * eye(dim.u*dim.x);
+QR = cell(1,2);
+QR{1,1} = Q;
+QR{1,2} = R;
+QR = blkdiag(QR{:});
+
+
+
+Phi_u = sdpvar(dim.B_u,dim.A_y,'full');
+Phi_y = inv(A_y)*(I_tot - B_u * Phi_u);
+Constraint = [];
+for k = 1 : dim.A_y-1
+    Constraint = [Constraint , Phi_y(k,k+1:end) == zeros(1, dim.A_y-k)];
+end
+for k = 1 : dim.A_y-1
+    Constraint = [Constraint , Phi_u(k,k+1:end) == zeros(1, dim.A_y-k)];
+end
+Constraint = [Constraint, Phi_u(1:dim.x,:) == zeros(dim.x, dim.A_y)];
+Objective = norm(QR*[Phi_y;Phi_u]*Sigma_yu,'fro');
+options = sdpsettings('solver','mosek');
+optimize(Constraint,Objective,options)
+y_vec = y_output(t_opt_start-dim.x+1:t_opt_start);
+y_vec = [y_vec; zeros(n_horizon,1)];
+value(Phi_y * y_vec)
+value(Phi_u * y_vec)
+
+Phi_u_fake = rand(size(Phi_u));
+Phi_y_fake = inv(A_y) * (I_tot-B_u * Phi_u_fake);
+save('Phi_y_fake.mat','Phi_y_fake')
+save('Phi_u_fake.mat','Phi_u_fake')
+
+
+
+
+
+
+
+
+
+function [dim,sys_state] = sys_gen()
+    A = [0.7 0.2 0;
+                 0.3 0.7 -0.1;
+                 0 -0.2 0.8];
+    B = [1;2;1.5]; 
+    C = [1 1 1];
+%     B = [1 1;2 2;1.5 3]; 
+%     C = [1 1 1;4 5 6];
+    D = zeros(size(C,1),size(B,2));
+    sys_state = ss(A,B,C,D,-1);
+    dim.x = size(sys_state.A,1);
+    dim.u = size(sys_state.B,2);
+    dim.y = size(sys_state.C,1);
+end
+
+function sys_state_onlystate = onlystate(sys_state,dim)
+    C = eye(dim.x);
+    D = zeros(dim.x,dim.u);
+    sys_state_onlystate = ss(sys_state.A,sys_state.B,C,D,-1);
+end
+
+function sanity_check(sys_state)
+    C_matrix = [sys_state.B sys_state.A * sys_state.B (sys_state.A)^2 * sys_state.B];
+    O_matrix = [sys_state.C; sys_state.C * sys_state.A; sys_state.C * (sys_state.A)^2];
+    c_eig = abs(svds(C_matrix));
+    o_eig = abs(svds(O_matrix));
+    if min(c_eig)<0.01 || min(o_eig)<0.01
+        error("not observable or controllable")
+    end
+end
+
+function sys_arx = space_to_arx(sys_state)
+    n_x = size(sys_state.A,1);
+    sys_arx = cell(2,n_x);   
+    sys_arx_intm = tf(sys_state);   
+    mat_u = cell2mat(sys_arx_intm.Numerator);
+    mat_y = -cell2mat(sys_arx_intm.Denominator);
+    for i = 1 : n_x
+        sys_arx{1,i} = mat_y(:,i+1 : n_x+1 : end);
+        sys_arx{2,i} = mat_u(:,i+1 : n_x+1 : end);
+    end
+end
+
+function Z = z_gen(dim,n_horizon)
+    n = dim.x+n_horizon;
+    Z_1 = eye((n-1) * dim.y);
+    Z_1 = [zeros(dim.y,(n-1) * dim.y);Z_1];
+    Z = [Z_1 zeros(n* dim.y,dim.y)];
+end
+
+function A = diag_mat(sys_arx,k,i,rep_times)
+    A_1 = sys_arx{i,k};
+    ACell = repmat({A_1}, 1, rep_times);
+    A = blkdiag(ACell{:});
+end
+
+function res = test_aybu(A_y,B_u,y_output,u_input,dim,t_opt_start,n_horizon)
+
+    u_vec = u_input(t_opt_start-dim.x+1:t_opt_start+n_horizon);
+    y_vec = y_output(t_opt_start-dim.x+1:t_opt_start+n_horizon);
+    
+    res = A_y * y_vec + B_u * u_vec;
+end
+
+
+
+             
